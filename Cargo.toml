@@ -1,0 +1,26 @@
+[package]
+name = "gxdl-rs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+embed-loaders = ["dep:rust-embed"]
+
+[dependencies]
+clap = { version = "4.5.61", features = ["derive"] }
+progressing = "3.0.2"
+rust-embed = { version = "8.5.0", features = ["include-exclude"], optional = true }
+serial2 = { version = "0.2.38", features = ["unix"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[[example]]
+name = "boot_file"
+path = "examples/boot_file.rs"
+
+[[example]]
+name = "embedded_loader"
+path = "examples/embedded_loader.rs"
+required-features = ["embed-loaders"]
