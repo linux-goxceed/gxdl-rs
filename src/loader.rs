@@ -2,8 +2,7 @@ use std::{fs, path::Path};
 
 use crate::AppResult;
 
-const MIN_BOOT_SIZE: usize = 0x2020;
-const STAGE1_END: usize = 0x201c;
+const MIN_BOOT_SIZE: usize = 0x1020;
 
 #[derive(Clone, Debug)]
 pub struct BootImage {
@@ -33,10 +32,23 @@ impl BootImage {
             return Err(format!("invalid boot loader magic: {:02x?}", magic));
         }
 
+        let chip = u16::from_le_bytes([data[6], data[7]]);
+        let required_size = match chip {
+            0x6612 => 0x4000,
+            0x6616 | 0x3211 | 0x6701 | 0x6705 => 0x2000,
+            _ => 0x1000,
+        };
+        if data.len() < required_size {
+            return Err(format!(
+                "boot loader '{name}' is too small for chip 0x{chip:04X}: {} bytes (need at least {required_size})",
+                data.len()
+            ));
+        }
+
         Ok(Self {
             name,
             version: u16::from_le_bytes([data[4], data[5]]),
-            chip: u16::from_le_bytes([data[6], data[7]]),
+            chip,
             baud: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
             data,
         })
@@ -57,7 +69,30 @@ impl BootImage {
     }
 
     pub fn stage1_payload(&self) -> &[u8] {
-        &self.data[0x20..STAGE1_END]
+        let transfer_size = self.stage1_transfer_size();
+        let end = if self.chip == 0x6612 {
+            transfer_size
+        } else {
+            0x20 + transfer_size - 4
+        };
+        &self.data[0x20..end]
+    }
+
+    pub fn stage1_header(&self) -> [u8; 5] {
+        let length_words = (self.stage1_transfer_size() / 4) as u16;
+        let mut header = [0u8; 5];
+        header[0] = 0x59;
+        header[1..3].copy_from_slice(&length_words.to_le_bytes());
+        header[3..5].copy_from_slice(&0u16.to_le_bytes());
+        header
+    }
+
+    pub fn stage1_transfer_size(&self) -> usize {
+        match self.chip {
+            0x6612 => 0x4000,
+            0x6616 | 0x3211 | 0x6701 | 0x6705 => 0x2000,
+            _ => 0x1000,
+        }
     }
 
     pub fn stage2(&self) -> ([u8; 8], Vec<u8>) {
@@ -68,10 +103,9 @@ impl BootImage {
 
         let checksum = content
             .iter()
-            .fold(0u16, |sum, byte| sum.wrapping_add(u16::from(*byte)));
+            .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
         let mut metadata = [0u8; 8];
-        metadata[..2].copy_from_slice(&checksum.to_le_bytes());
-        metadata[2..4].copy_from_slice(&0x00c2u16.to_le_bytes());
+        metadata[..4].copy_from_slice(&checksum.to_le_bytes());
         metadata[4..].copy_from_slice(&(self.data.len() as u32).to_le_bytes());
         (metadata, content)
     }
@@ -148,7 +182,7 @@ mod tests {
     use super::*;
 
     fn image() -> BootImage {
-        let mut data = vec![0u8; MIN_BOOT_SIZE + 17];
+        let mut data = vec![0u8; 0x201c + 17];
         data[..4].copy_from_slice(b"toob");
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0x6701u16.to_le_bytes());
@@ -166,6 +200,8 @@ mod tests {
         assert_eq!(image.chip, 0x6701);
         assert_eq!(image.baud, 115_200);
         assert_eq!(image.stage1_payload().len(), 8188);
+        assert_eq!(image.stage1_transfer_size(), 0x2000);
+        assert_eq!(image.stage1_header(), [0x59, 0x00, 0x08, 0x00, 0x00]);
     }
 
     #[test]
@@ -175,15 +211,50 @@ mod tests {
         assert_eq!(&content[..4], b"toob");
         assert_eq!(&content[4..8], &[0, 1, 2, 3]);
         assert_eq!(content.len(), image.len());
-        assert_eq!(u16::from_le_bytes([metadata[2], metadata[3]]), 0x00c2);
         assert_eq!(
             u32::from_le_bytes(metadata[4..8].try_into().unwrap()) as usize,
             image.len()
         );
         let sum = content
             .iter()
-            .fold(0u16, |sum, byte| sum.wrapping_add(*byte as u16));
-        assert_eq!(u16::from_le_bytes([metadata[0], metadata[1]]), sum);
+            .fold(0u32, |sum, byte| sum.wrapping_add(*byte as u32));
+        assert_eq!(u32::from_le_bytes(metadata[..4].try_into().unwrap()), sum);
+    }
+
+    #[test]
+    fn reference_gemini_loader_has_protocol_checksum() {
+        let image =
+            BootImage::from_file(Path::new("src/loaders/gemini-6702H5-sflash-24M.boot")).unwrap();
+        let (metadata, _) = image.stage2();
+        assert_eq!(metadata, [0x1b, 0x34, 0xc2, 0x00, 0x3c, 0x42, 0x02, 0x00]);
+    }
+
+    #[test]
+    fn stage1_layout_follows_chip_id() {
+        for (chip, transfer_size) in [
+            (0x6612, 0x4000),
+            (0x6616, 0x2000),
+            (0x3211, 0x2000),
+            (0x6701, 0x2000),
+            (0x6705, 0x2000),
+            (0x6613, 0x1000),
+        ] {
+            let mut data = vec![0u8; 0x4020];
+            data[..4].copy_from_slice(b"toob");
+            data[6..8].copy_from_slice(&(chip as u16).to_le_bytes());
+            let image = BootImage::parse(format!("{chip:x}.boot"), data).unwrap();
+            assert_eq!(image.stage1_transfer_size(), transfer_size);
+            let expected_payload = if chip == 0x6612 {
+                transfer_size - 0x20
+            } else {
+                transfer_size - 4
+            };
+            assert_eq!(image.stage1_payload().len(), expected_payload);
+            assert_eq!(
+                u16::from_le_bytes([image.stage1_header()[1], image.stage1_header()[2]]),
+                (transfer_size / 4) as u16
+            );
+        }
     }
 
     #[cfg(feature = "embed-loaders")]

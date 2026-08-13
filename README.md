@@ -103,6 +103,8 @@ gxdl-rs -d /dev/ttyUSB0 --loopback-test
 
 Transfer mode `s`, the default, sends a selected loader. Transfer mode `nns` skips BootROM upload and therefore needs only a serial device.
 
+The uploader chooses the Stage 1 packet layout from the loader header's chip ID: `0x6612` transfers the 0x4000-byte layout, `0x6616`, `0x3211`, `0x6701`, and `0x6705` use the 0x2000-byte layout, and other IDs use the 0x1000-byte layout. Stage 2 sends the `boot` continuation marker from Stage 1, then a little-endian 32-bit additive checksum, the original file size, and transformed content after `RUNGET`.
+
 ## Commands
 
 Bootloader commands are passed as one quoted value through `-c/--command`. Arguments are separated on whitespace, matching the reference utility, so filenames containing whitespace are not supported.

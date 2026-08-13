@@ -10,7 +10,6 @@ use crate::{
     serial::{Transport, pulse_reset},
 };
 
-const STAGE1_HEADER: &[u8] = &[0x59, 0x00, 0x08, 0x00, 0x00];
 const STAGE1_TERMINATOR: &[u8] = b"boot";
 const GX_KEY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
@@ -56,22 +55,21 @@ impl<T: Transport> Session<T> {
         self.log(&format!("Handshake detected: {}", hex(&handshake)));
 
         self.log("Sending Stage 1");
-        self.write(STAGE1_HEADER)?;
-        self.write(image.stage1_payload())?;
-        self.write(STAGE1_TERMINATOR)?;
+        let header = image.stage1_header();
+        let mut stage1 = Vec::with_capacity(header.len() + image.stage1_payload().len() + 4);
+        stage1.extend_from_slice(&header);
+        stage1.extend_from_slice(image.stage1_payload());
+        stage1.extend_from_slice(STAGE1_TERMINATOR);
+        self.write(&stage1)?;
         self.flush()?;
-        self.log(&format!(
-            "Stage 1 complete: {} bytes",
-            STAGE1_HEADER.len() + image.stage1_payload().len() + STAGE1_TERMINATOR.len()
-        ));
+        self.log(&format!("Stage 1 complete: {} bytes", stage1.len()));
 
-        self.wait_for_runget(Duration::from_secs(10))?;
+        self.wait_for_runget(Duration::from_secs(15))?;
         thread::sleep(Duration::from_millis(50));
 
         let (metadata, content) = image.stage2();
         self.log(&format!("Sending Stage 2 metadata: {}", hex(&metadata)));
-        self.write(&metadata[..4])?;
-        self.write(&metadata[4..])?;
+        self.write(&metadata)?;
         self.send_chunks(&content, 2048, "Loader")?;
         self.flush()?;
 
@@ -236,7 +234,12 @@ impl<T: Transport> Session<T> {
         loop {
             if let Some((start, end)) = find_handshake(&self.pending) {
                 let handshake = self.pending[start..end].to_vec();
-                self.pending.drain(..end);
+                self.pending.clear();
+                // IPL output can continue briefly after the final 0x58.
+                thread::sleep(Duration::from_millis(5));
+                self.io
+                    .discard_buffers()
+                    .map_err(|error| format!("failed to flush IPL noise: {error}"))?;
                 return Ok(handshake);
             }
             if self.pending.len() > 32 {
@@ -257,11 +260,27 @@ impl<T: Transport> Session<T> {
         let deadline = Instant::now() + timeout;
         let mut got_run_at = None;
         loop {
-            if find_bytes(&self.pending, b"RUN").is_some() && got_run_at.is_none() {
+            if find_case_insensitive(&self.pending, b"RUNGET").is_some() {
+                println!("[*] Received RUN");
+                println!("[*] Received GET");
+                self.pending.clear();
+                return Ok(());
+            }
+            if find_tolerant_runget(&self.pending, 4).is_some() {
+                println!("[*] Detected tolerant RUNGET");
+                self.pending.clear();
+                return Ok(());
+            }
+            if find_ordered_runget(&self.pending, 40).is_some() {
+                println!("[*] Detected RUNGET through IPL noise");
+                self.pending.clear();
+                return Ok(());
+            }
+            if find_token(&self.pending, b"RUN").is_some() && got_run_at.is_none() {
                 println!("[*] Received RUN");
                 got_run_at = Some(Instant::now());
             }
-            if got_run_at.is_some() && find_bytes(&self.pending, b"GET").is_some() {
+            if got_run_at.is_some() && find_token(&self.pending, b"GET").is_some() {
                 println!("[*] Received GET");
                 self.pending.clear();
                 return Ok(());
@@ -448,15 +467,18 @@ pub fn gx_checksum(data: &[u8]) -> u32 {
 }
 
 fn find_handshake(data: &[u8]) -> Option<(usize, usize)> {
-    const PATTERNS: [&[u8]; 4] = [
-        &[0xb0, 0xb0, 0x58],
-        &[0xb8, 0xb0, 0xff, 0x58],
-        &[0x00, 0xb0, 0xb0, 0x58],
-        &[0xb0, 0x30, 0xff, 0x58],
-    ];
-    PATTERNS
-        .iter()
-        .find_map(|pattern| find_bytes(data, pattern).map(|start| (start, start + pattern.len())))
+    // IPL noise varies, so anchor on 0x58 and accept a valid prefix in the
+    // preceding three bytes, matching the reference's tolerant detector.
+    for (index, byte) in data.iter().enumerate() {
+        if *byte != 0x58 || index < 2 {
+            continue;
+        }
+        let start = index.saturating_sub(3);
+        if matches!(data[start], 0x00 | 0xb0 | 0xb8) {
+            return Some((start, index + 1));
+        }
+    }
+    None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -472,6 +494,80 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn find_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn find_token(haystack: &[u8], token: &[u8]) -> Option<usize> {
+    haystack
+        .windows(token.len())
+        .enumerate()
+        .position(|(start, window)| {
+            if !window.eq_ignore_ascii_case(token) {
+                return false;
+            }
+            let before = start == 0 || !haystack[start - 1].is_ascii_alphanumeric();
+            let end = start + token.len();
+            let after = end == haystack.len() || !haystack[end].is_ascii_alphanumeric();
+            before && after
+        })
+}
+
+fn find_tolerant_runget(data: &[u8], max_gap: usize) -> Option<usize> {
+    let pattern = b"RUNGET";
+    let mut pattern_index = 0;
+    let mut last = None;
+    for (index, byte) in data.iter().enumerate() {
+        if byte.to_ascii_uppercase() != pattern[pattern_index] {
+            continue;
+        }
+        if let Some(previous) = last {
+            let gap = &data[previous + 1..index];
+            if gap.len() > max_gap || gap.iter().any(u8::is_ascii_alphanumeric) {
+                pattern_index = 0;
+                last = None;
+                continue;
+            }
+        }
+        last = Some(index);
+        pattern_index += 1;
+        if pattern_index == pattern.len() {
+            return last;
+        }
+    }
+    None
+}
+
+fn find_ordered_runget(data: &[u8], max_gap: usize) -> Option<usize> {
+    let pattern = b"RUNGET";
+    let mut pattern_index = 0;
+    let mut first = None;
+    let mut last = None;
+    for (index, byte) in data.iter().enumerate() {
+        if byte.to_ascii_uppercase() != pattern[pattern_index] {
+            continue;
+        }
+        if let Some(previous) = last {
+            if index - previous > max_gap {
+                pattern_index = 0;
+                first = None;
+                last = None;
+                continue;
+            }
+        } else {
+            first = Some(index);
+        }
+        last = Some(index);
+        pattern_index += 1;
+        if pattern_index == pattern.len() {
+            return first;
+        }
+    }
+    None
 }
 
 fn clean_text_response(command: &str, response: &[u8]) -> String {
@@ -604,6 +700,24 @@ mod tests {
     }
 
     #[test]
+    fn detects_handshake_after_ipl_noise() {
+        let io = MockTransport::with_reads(&[&[0x19, 0x72, 0xb8], &[0xb0, 0xff], &[0x58]]);
+        let mut session = Session::new(io, false);
+        assert_eq!(
+            session
+                .wait_for_handshake(Duration::from_millis(50))
+                .unwrap(),
+            [0xb8, 0xb0, 0xff, 0x58]
+        );
+    }
+
+    #[test]
+    fn detects_runget_with_separators_and_ipl_noise() {
+        let mut session = Session::new(MockTransport::with_reads(&[b"19RUkgd:3\r\nNGET"]), false);
+        session.wait_for_runget(Duration::from_millis(50)).unwrap();
+    }
+
+    #[test]
     fn binary_read_preserves_payload_and_following_markers_in_one_read() {
         let io = MockTransport::with_reads(&[
             b"boot>",
@@ -631,11 +745,15 @@ mod tests {
         assert!(find_bytes(&output, b"boot>").is_some());
 
         let writes = &session.io.writes;
-        assert_eq!(&writes[..5], STAGE1_HEADER);
-        assert_eq!(&writes[5..5 + 8188], image.stage1_payload());
-        assert_eq!(&writes[5 + 8188..5 + 8188 + 4], b"boot");
+        assert_eq!(&writes[..5], image.stage1_header());
+        assert_eq!(
+            &writes[5..5 + image.stage1_payload().len()],
+            image.stage1_payload()
+        );
+        let stage1_end = 5 + image.stage1_payload().len();
+        assert_eq!(&writes[stage1_end..stage1_end + 4], b"boot");
 
-        let stage2_start = 5 + 8188 + 4;
+        let stage2_start = stage1_end + 4;
         let (metadata, content) = image.stage2();
         assert_eq!(&writes[stage2_start..stage2_start + 8], &metadata);
         assert_eq!(&writes[stage2_start + 8..], &content);
